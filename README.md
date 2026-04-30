@@ -1,1 +1,1 @@
-# Adaptive-Differential-Noise-Correction
+# Gated Regression with Adaptive Standard-addition Protocol
