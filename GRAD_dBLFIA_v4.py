@@ -1,624 +1,800 @@
+# ===========================================================================
 # =============================================================================
-#  GRASP_dBLFIA_fast_v2.py
-#  Gated Regression with Adaptive Standard-addition Protocol
-#  * Speed-optimised (imread/analysis cache, fast rolling-ball, debounce,
-#    reused matplotlib canvas)
-#  * NEW: bright-field images are optional. If none are provided, GRASP
-#    falls back to analog-only mode and computes T from fluorescence alone.
+# Core rules:
+# 1) S0 is the absolute PBS-blank signal.
+# 2) Initial threshold theta0 = blank background mean + 3 SD.
+# 3) Bright-field defines occupied capture-trap ROIs. Fluorescence images are
+#    ECC-registered to bright-field; one trap contributes at most one event.
+# 4) Fluorescence objects outside occupied-trap ROIs are never counted.
+# 5) One common threshold is selected for the complete standard-addition series
+#    by a deterministic constrained search, not by sample-specific tuning.
+# 6) Digital mode uses f=n_positive/N_valid and lambda=-ln(1-f).
+#    Fluorescence-only input forces analog mode.
+# 7) T+C0 and T+C1 support a two-point estimate. The full quantitative-window
+#    gate requires T+C2. If the available gradient chain fails, T is marked
+#    non-reportable: OUT OF QUANTITATIVE WINDOW - DILUTE AND RE-MEASURE.
+# 8) Processing panel exposes threshold controls only. Registration/trap-QC
+#    parameters are fixed, versioned constants and exported in the audit log.
 # =============================================================================
 
+import csv
+import json
+import hashlib
+import platform
+from datetime import datetime, timezone
+from pathlib import Path
+import warnings
 import cv2
 import numpy as np
-from tkinter import (
-    Tk, Label, Scale, StringVar, BooleanVar,
-    HORIZONTAL, N, S, E, W, LEFT,
-)
+from tkinter import Tk, Label, Scale, StringVar, BooleanVar, IntVar
+from tkinter import HORIZONTAL, N, S, E, W, LEFT
 from tkinter import filedialog, ttk, messagebox
 from PIL import Image, ImageTk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-import warnings
 
-warnings.simplefilter('ignore', np.RankWarning)
+warnings.simplefilter("ignore", np.RankWarning)
 
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
-F_GATE = 0.7
-T_EST_4PT_THR = 100.0
+APP_NAME = "GRASP dB-LFIA"
+APP_VERSION = "7.7.0-compact"
+METHOD_ID = "GRASP-gate-endpoint-v1"
+F_GATE = 0.70
+BG_SD_FACTOR = 3.0
+THRESHOLD_SEARCH_RADIUS = 255
+THRESHOLD_SEARCH_STEP = 1
+CHAIN_REL_TOL = 1e-6
+CHAIN_ABS_TOL = 1e-12
+ECC_MIN_CC = 0.70
+ECC_MAX_ITER = 250
+ECC_EPS = 1e-6
+ROI_DILATION_PX = 2
+TRAP_MIN_AREA_PX = 12
+TRAP_MAX_AREA_PX = 5000
+TRAP_BORDER_MARGIN_PX = 3
+MIN_VALID_TRAPS = 20
+MIN_ROI_OVERLAP = 0.25
+MIN_POSITIVE_PIXELS = 1
+DEBOUNCE_MS = 180
+EPS = 1e-12
 
-RESPONSE_CONSTANTS = {
-    "IgE":   {"k": 3.9e-2, "alpha": 1.1e3},
-    "TNF-a": {"k": 2.4e-2, "alpha": 4.2e2},
-    "NfL":   {"k": 1.2e-2, "alpha": 1.8e2},
+STATUS_IN = "IN QUANTITATIVE WINDOW"
+STATUS_PARTIAL = "PROVISIONAL TWO-POINT ESTIMATE - FULL WINDOW GATE NOT EVALUABLE"
+STATUS_OUT = "OUT OF QUANTITATIVE WINDOW - DILUTE AND RE-MEASURE"
+STATUS_FAIL = "ANALYSIS FAILED"
+
+AUDIT_CONFIG = {
+    "app": APP_NAME, "version": APP_VERSION, "method_id": METHOD_ID,
+    "f_gate": F_GATE, "bg_sd_factor": BG_SD_FACTOR,
+    "threshold_search_radius": THRESHOLD_SEARCH_RADIUS,
+    "threshold_search_step": THRESHOLD_SEARCH_STEP,
+    "chain_rel_tol": CHAIN_REL_TOL, "chain_abs_tol": CHAIN_ABS_TOL,
+    "ecc_min_cc": ECC_MIN_CC, "ecc_max_iter": ECC_MAX_ITER,
+    "ecc_eps": ECC_EPS, "roi_dilation_px": ROI_DILATION_PX,
+    "trap_min_area_px": TRAP_MIN_AREA_PX, "trap_max_area_px": TRAP_MAX_AREA_PX,
+    "trap_border_margin_px": TRAP_BORDER_MARGIN_PX,
+    "min_valid_traps": MIN_VALID_TRAPS, "min_roi_overlap": MIN_ROI_OVERLAP,
+    "min_positive_pixels": MIN_POSITIVE_PIXELS,
 }
 
-DEBOUNCE_MS = 120
+_IMG_CACHE = {}
+_BF_CACHE = {}
+_REG_CACHE = {}
 
-# -----------------------------------------------------------------------------
-# Caches
-# -----------------------------------------------------------------------------
-_IMG_CACHE = {}       # path -> gray ndarray
-_FLUOR_CACHE = {}     # (path, ft, bgr, mna, mxa) -> metrics
-_BF_CACHE = {}        # (path, mna, mxa) -> metrics
 
-def cached_imread(path):
-    if path in _IMG_CACHE:
-        return _IMG_CACHE[path]
-    gray = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    if gray is None:
-        raise ValueError(f"Cannot read: {path}")
-    _IMG_CACHE[path] = gray
-    return gray
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
 
-# -----------------------------------------------------------------------------
-# Image processing
-# -----------------------------------------------------------------------------
-def fast_rolling_ball(gray, radius=25):
-    r = max(1, int(radius))
-    scale = max(1, r // 4)
-    if scale > 1:
-        small = cv2.resize(gray, (gray.shape[1] // scale, gray.shape[0] // scale),
-                           interpolation=cv2.INTER_AREA)
-    else:
-        small = gray
-    k = max(3, (r // scale) * 2 + 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    bg_small = cv2.morphologyEx(small, cv2.MORPH_OPEN, kernel)
-    if scale > 1:
-        bg = cv2.resize(bg_small, (gray.shape[1], gray.shape[0]),
-                        interpolation=cv2.INTER_LINEAR)
-    else:
-        bg = bg_small
-    return bg
 
-def detect_components(binary, min_area, max_area):
-    num_lbl, cc, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    keep_idx = np.where((areas >= min_area) & (areas <= max_area))[0] + 1
-    out = np.zeros_like(binary)
-    masks = []
-    for i in keep_idx:
-        m = cc == i
-        out[m] = 255
-        masks.append(m)
-    return len(keep_idx), out, masks
+def cached_gray(path):
+    if path not in _IMG_CACHE:
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise ValueError(f"Cannot read image: {path}")
+        _IMG_CACHE[path] = img
+    return _IMG_CACHE[path]
 
-def analyze_fluorescence(path, fluor_thresh, bg_radius, min_area, max_area):
-    key = (path, int(fluor_thresh), int(bg_radius), int(min_area), int(max_area))
-    if key in _FLUOR_CACHE:
-        return _FLUOR_CACHE[key]
-    gray = cached_imread(path)
-    bg = fast_rolling_ball(gray, bg_radius)
-    corr = cv2.subtract(gray, bg)
-    blur = cv2.GaussianBlur(corr, (3, 3), 0)
-    _, binary = cv2.threshold(blur, int(fluor_thresh), 255, cv2.THRESH_BINARY)
-    n, filtered, masks = detect_components(binary, min_area, max_area)
-    if masks:
-        union = np.zeros_like(corr, dtype=bool)
-        for m in masks:
-            union |= m
-        net_intensity = float(corr[union].sum())
-    else:
-        net_intensity = 0.0
-    pw = 160
-    preview = np.hstack([cv2.resize(g, (pw, pw), interpolation=cv2.INTER_AREA)
-                         for g in (gray, corr, filtered)])
-    metrics = {"n": n, "net_intensity": net_intensity, "preview": preview}
-    _FLUOR_CACHE[key] = metrics
-    if len(_FLUOR_CACHE) > 128:
-        _FLUOR_CACHE.pop(next(iter(_FLUOR_CACHE)))
-    return metrics
 
-def analyze_brightfield(path, min_area, max_area):
-    key = (path, int(min_area), int(max_area))
-    if key in _BF_CACHE:
-        return _BF_CACHE[key]
-    gray = cached_imread(path)
+def robust_blank_stats(gray):
+    v = gray.astype(np.float64).ravel()
+    keep = np.ones(v.shape, dtype=bool)
+    for _ in range(8):
+        x = v[keep]
+        mu, sd = float(x.mean()), float(x.std(ddof=1)) if x.size > 1 else 0.0
+        new = (v >= mu - 3 * max(sd, 1e-6)) & (v <= mu + 3 * max(sd, 1e-6))
+        if np.array_equal(new, keep):
+            break
+        keep = new
+    x = v[keep]
+    return float(x.mean()), float(x.std(ddof=1)) if x.size > 1 else 0.0
+
+
+def initial_threshold(blank_path):
+    mu, sd = robust_blank_stats(cached_gray(blank_path))
+    return int(np.clip(round(mu + BG_SD_FACTOR * sd), 0, 255)), mu, sd
+
+
+def segment_traps(bf_path):
+    if bf_path in _BF_CACHE:
+        return _BF_CACHE[bf_path]
+    gray = cached_gray(bf_path)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    block = max(15, (min(gray.shape) // 20) | 1)
     binary = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY_INV, 31, 5)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    N, filtered, _ = detect_components(binary, min_area, max_area)
-    pw = 200
-    preview = np.hstack([cv2.resize(g, (pw, pw), interpolation=cv2.INTER_AREA)
-                         for g in (gray, filtered)])
-    metrics = {"N": N, "preview": preview}
-    _BF_CACHE[key] = metrics
-    if len(_BF_CACHE) > 64:
-        _BF_CACHE.pop(next(iter(_BF_CACHE)))
-    return metrics
+                                   cv2.THRESH_BINARY_INV, block, 3)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    n, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+    h, w = gray.shape
+    rois, rejected = [], {"area": 0, "border": 0, "shape": 0}
+    for i in range(1, n):
+        x, y, bw, bh, area = stats[i]
+        if area < TRAP_MIN_AREA_PX or area > TRAP_MAX_AREA_PX:
+            rejected["area"] += 1; continue
+        if x < TRAP_BORDER_MARGIN_PX or y < TRAP_BORDER_MARGIN_PX or \
+           x + bw >= w - TRAP_BORDER_MARGIN_PX or y + bh >= h - TRAP_BORDER_MARGIN_PX:
+            rejected["border"] += 1; continue
+        aspect = max(bw / max(bh, 1), bh / max(bw, 1))
+        if aspect > 2.5:
+            rejected["shape"] += 1; continue
+        mask = labels == i
+        if ROI_DILATION_PX > 0:
+            mask = cv2.dilate(mask.astype(np.uint8),
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                                        (2 * ROI_DILATION_PX + 1,) * 2)) > 0
+        rois.append({"id": len(rois) + 1, "mask": mask,
+                     "centroid": [float(centroids[i][0]), float(centroids[i][1])],
+                     "area": int(area), "bbox": [int(x), int(y), int(bw), int(bh)]})
+    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    for r in rois:
+        x, y, bw, bh = r["bbox"]
+        cv2.rectangle(overlay, (x, y), (x + bw, y + bh), (0, 255, 0), 1)
+    out = {"gray": gray, "rois": rois, "N": len(rois),
+           "rejected": rejected, "preview": overlay}
+    _BF_CACHE[bf_path] = out
+    return out
 
-# -----------------------------------------------------------------------------
-# GRASP engine
-# -----------------------------------------------------------------------------
-def resolve_mode(f0, auto, manual, has_bf):
-    """
-    Mode-routing logic.
-    If bright-field is unavailable → force analog regardless of auto/manual.
-    """
-    if not has_bf:
-        return "analog"
-    if auto:
-        return "analog" if f0 > F_GATE else "digital"
-    return manual
 
-def fit_line(C, y):
-    C = np.asarray(C, dtype=float); y = np.asarray(y, dtype=float)
-    mask = np.isfinite(C) & np.isfinite(y)
-    C, y = C[mask], y[mask]
-    if len(C) < 2:
-        return np.nan, np.nan, np.array([]), np.nan
-    a, b = np.polyfit(C, y, 1)
-    yf = a * C + b
-    ss_r = float(np.sum((y - yf) ** 2))
-    ss_t = float(np.sum((y - np.mean(y)) ** 2))
-    r2 = 1.0 if ss_t < 1e-30 else 1.0 - ss_r / ss_t
-    return float(a), float(b), yf, r2
+def register_fluorescence(fluor_path, bf_path):
+    key = (fluor_path, bf_path)
+    if key in _REG_CACHE:
+        return _REG_CACHE[key]
+    moving = cached_gray(fluor_path)
+    fixed = cached_gray(bf_path)
+    if moving.shape != fixed.shape:
+        moving = cv2.resize(moving, (fixed.shape[1], fixed.shape[0]),
+                            interpolation=cv2.INTER_LINEAR)
+    f = cv2.normalize(cv2.GaussianBlur(fixed, (5, 5), 0).astype(np.float32),
+                      None, 0, 1, cv2.NORM_MINMAX)
+    m = cv2.normalize(cv2.GaussianBlur(moving, (5, 5), 0).astype(np.float32),
+                      None, 0, 1, cv2.NORM_MINMAX)
+    warp = np.eye(2, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                ECC_MAX_ITER, ECC_EPS)
+    try:
+        cc, warp = cv2.findTransformECC(f, m, warp, cv2.MOTION_EUCLIDEAN,
+                                        criteria, None, 3)
+        registered = cv2.warpAffine(moving, warp, (fixed.shape[1], fixed.shape[0]),
+                                    flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        ok = bool(np.isfinite(cc) and cc >= ECC_MIN_CC)
+        error = "" if ok else f"ECC correlation {cc:.4f} below {ECC_MIN_CC:.2f}"
+    except cv2.error as e:
+        cc, ok, error = np.nan, False, str(e).split("\n")[0]
+        registered = moving
+    out = {"image": registered, "warp": warp.tolist(), "cc": float(cc),
+           "ok": ok, "error": error}
+    _REG_CACHE[key] = out
+    return out
 
-def safe_f(n_net, N):
-    if N is None or N <= 0:
-        return 0.0
-    return float(min(max(n_net / N, 1e-9), 1 - 1e-9))
 
-def run_grasp(fm_blank, fm_list, bm_list, auto, manual, analyte,
-              user_C1=None, user_C2=None, use_4pt_if_allowed=False):
-    """
-    bm_list: list that may contain None entries. If all entries are None
-             (or bm_list is None), the algorithm runs analog-only.
-    """
-    k = RESPONSE_CONSTANTS[analyte]["k"]
-    alpha = RESPONSE_CONSTANTS[analyte]["alpha"]
+def global_fluor_metrics(fluor_path, threshold):
+    gray = cached_gray(fluor_path)
+    pos = gray > int(threshold)
+    return {"signal": float(gray.sum()), "positive_pixels": int(pos.sum()),
+            "positive_area": pos}
 
-    n_blank = fm_blank["n"]
-    I_blank = fm_blank["net_intensity"]
 
-    # Normalise bm_list
-    if bm_list is None:
-        bm_list = [None] * len(fm_list)
-    has_bf_any = any(bm is not None for bm in bm_list)
-    bm0 = bm_list[0] if len(bm_list) > 0 else None
-    has_bf_stage1 = bm0 is not None
+def trap_metrics(fluor_path, bf_path, threshold):
+    bf = segment_traps(bf_path)
+    reg = register_fluorescence(fluor_path, bf_path)
+    img = reg["image"]
+    positive = img > int(threshold)
+    rows, n_pos, assigned_pixels = [], 0, 0
+    for roi in bf["rois"]:
+        mask = roi["mask"]
+        roi_n = int(mask.sum())
+        pos_n = int(np.count_nonzero(positive & mask))
+        overlap = pos_n / max(roi_n, 1)
+        is_pos = pos_n >= MIN_POSITIVE_PIXELS and overlap >= MIN_ROI_OVERLAP
+        n_pos += int(is_pos)
+        assigned_pixels += pos_n
+        vals = img[mask]
+        rows.append({"trap_id": roi["id"], "positive": bool(is_pos),
+                     "overlap": float(overlap), "positive_pixels": pos_n,
+                     "integrated_intensity": float(vals.sum()),
+                     "mean_intensity": float(vals.mean()) if vals.size else 0.0})
+    union = np.zeros_like(img, dtype=bool)
+    for roi in bf["rois"]:
+        union |= roi["mask"]
+    unassigned = int(np.count_nonzero(positive & ~union))
+    preview = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    for row, roi in zip(rows, bf["rois"]):
+        x, y, bw, bh = roi["bbox"]
+        color = (255, 0, 0) if row["positive"] else (0, 255, 0)
+        cv2.rectangle(preview, (x, y), (x + bw, y + bh), color, 1)
+    N = bf["N"]
+    return {"N": N, "n_positive": n_pos,
+            "f": n_pos / N if N else np.nan,
+            "trap_rows": rows, "unassigned_positive_pixels": unassigned,
+            "assigned_positive_pixels": assigned_pixels,
+            "signal": float(img[union].sum()) if N else np.nan,
+            "registration": reg, "trap_qc": bf["rejected"], "preview": preview}
 
-    # -------- Stage 1 --------
-    n0_net = max(fm_list[0]["n"] - n_blank, 0)
-    I0_net = max(fm_list[0]["net_intensity"] - I_blank, 0.0)
-    N0 = bm0["N"] if has_bf_stage1 else None
-    f0 = safe_f(n0_net, N0) if has_bf_stage1 else np.nan
-    mode = resolve_mode(f0, auto, manual, has_bf_stage1)
-    if mode == "digital":
-        T_est = -np.log(1.0 - f0) / k
+
+def safe_lambda(f):
+    if not np.isfinite(f):
+        return np.nan
+    return float(-np.log(1 - np.clip(f, 1e-9, 1 - 1e-9)))
+
+
+def fit_standard_addition(C, y):
+    """y = a*C + b; x_intercept = -b/a; T = |x_intercept|."""
+    C, y = np.asarray(C, float), np.asarray(y, float)
+    m = np.isfinite(C) & np.isfinite(y)
+    C, y = C[m], y[m]
+    empty = {"a": np.nan, "b": np.nan, "x_intercept": np.nan,
+             "T": np.nan, "r2": np.nan, "intercept_sign_ok": False}
+    if len(C) < 2 or len(np.unique(C)) < 2:
+        return empty
+    if len(C) == 2:
+        a = (y[1] - y[0]) / (C[1] - C[0]); b = y[0] - a * C[0]; r2 = np.nan
     else:
-        T_est = I0_net / alpha
+        a, b = np.polyfit(C, y, 1)
+        ssr = float(np.sum((y - (a * C + b)) ** 2))
+        sst = float(np.sum((y - y.mean()) ** 2))
+        r2 = 1.0 if sst < EPS else 1.0 - ssr / sst
+    if not np.isfinite(a) or abs(a) <= EPS:
+        return empty
+    xi = float(-b / a)
+    return {"a": float(a), "b": float(b), "x_intercept": xi,
+            "T": abs(xi), "r2": float(r2), "intercept_sign_ok": bool(xi < 0)}
 
-    # -------- Stage 2 --------
-    C1 = float(user_C1) if user_C1 is not None else max(T_est, 1e-9)
-    C2 = float(user_C2) if user_C2 is not None else 2.0 * C1
-    four_pt = use_4pt_if_allowed and (T_est > T_EST_4PT_THR) and (len(fm_list) >= 4)
-    C_list = [0.0, C1, C2, 4.0 * C1] if four_pt else [0.0, C1, C2]
-    n = len(C_list)
-    fm_use = fm_list[:n]
-    bm_use = bm_list[:n] if bm_list is not None else [None] * n
 
-    n_net = np.array([max(fm["n"] - n_blank, 0) for fm in fm_use], dtype=float)
-    I_net = np.array([max(fm["net_intensity"] - I_blank, 0.0) for fm in fm_use], dtype=float)
+def gradient_gate(S0, S, C, T):
+    """
+    Endpoint rule. g1 is always the left-hand side; the right-hand side is the
+    LAST gradient the loaded data can support, and it extends as stages are added:
 
-    if mode == "digital":
-        Ns = [bm["N"] if bm is not None else None for bm in bm_use]
-        fs = [safe_f(nn, NN) for nn, NN in zip(n_net, Ns)]
-        y = np.array([-np.log(1 - f) for f in fs])
+      blank + T+C0 + T+C1                  -> g1 <= g2
+        g1 = (S_t0 - S0)/T,  g2 = (S_t1 - S0)/(T + C1)
+      blank + T+C0 + T+C1 + T+C2           -> g1 <= g3
+        g3 = (S_t2 - S_t1)/(C2 - C1)
+      blank + T+C0 + T+C1 + T+C2 + T+C3    -> g1 <= g4
+        g4 = (S_t3 - S_t2)/(C3 - C2)
+
+    All intermediate gradients are still reported for inspection, but the
+    pass/fail decision uses g1 versus the final endpoint gradient.
+    """
+    out = {"gradients": {}, "checks": [], "pass": None, "coverage": "none",
+           "required_rule": "not evaluable", "message": "",
+           "n_evaluable": 0, "endpoint": "", "violation": np.inf}
+    if not np.isfinite(T) or T <= 0:
+        out["message"] = "T not positive; gate undefined"
+        return out
+
+    g, labels = {}, {}
+    if len(S) >= 1 and T > EPS:
+        g["g1"] = (S[0] - S0) / T
+        labels["g1"] = "(S_t0-S_0)/T"
+    if len(S) >= 2 and len(C) >= 2 and (T + C[1]) > EPS:
+        g["g2"] = (S[1] - S0) / (T + C[1])
+        labels["g2"] = "(S_t1-S_0)/(T+C_1)"
+    # incremental span gradients for each additional spiked stage
+    for j in range(2, len(S)):
+        if j < len(C) and (C[j] - C[j - 1]) > EPS:
+            key = f"g{j + 1}"
+            g[key] = (S[j] - S[j - 1]) / (C[j] - C[j - 1])
+            labels[key] = f"(S_t{j}-S_t{j-1})/(C_{j}-C_{j-1})"
+    out["gradients"] = {k: float(v) for k, v in g.items()}
+    out["gradient_labels"] = labels
+
+    order = [k for k in sorted(g, key=lambda s: int(s[1:]))]
+    if len(order) < 2:
+        out["message"] = "no inequality evaluable"
+        return out
+
+    endpoint = order[-1]
+    out["endpoint"] = endpoint
+    lv, rv = g["g1"], g[endpoint]
+    scale = max(abs(lv), abs(rv), 1.0)
+    tol = CHAIN_ABS_TOL + CHAIN_REL_TOL * scale
+    ok = bool(lv <= rv + tol)
+    out["checks"] = [{"left": "g1", "right": endpoint,
+                      "left_value": float(lv), "right_value": float(rv),
+                      "pass": ok}]
+    out["n_evaluable"] = 1
+    out["pass"] = ok
+    out["violation"] = 0.0 if ok else float((lv - rv) / scale)
+    out["required_rule"] = f"g1 <= {endpoint}"
+    out["rule_expanded"] = f"{labels['g1']} <= {labels[endpoint]}"
+    out["coverage"] = "full" if len(order) >= 3 else "two_point"
+    out["message"] = (f"{out['rule_expanded']} satisfied" if ok else
+                      f"g1 > {endpoint} ({lv:.5g} > {rv:.5g})")
+    return out
+
+
+def threshold_candidates(theta0, manual_theta=None):
+    """Full 0-255 sweep visited outward from theta0 = BG + 3 SD."""
+    if manual_theta is not None:
+        return [int(np.clip(manual_theta, 0, 255))]
+    lo = max(0, theta0 - THRESHOLD_SEARCH_RADIUS)
+    hi = min(255, theta0 + THRESHOLD_SEARCH_RADIUS)
+    vals = list(range(lo, hi + 1, THRESHOLD_SEARCH_STEP))
+    return sorted(vals, key=lambda t: (abs(t - theta0), t))
+
+
+def evaluate_threshold(blank_path, fluor_paths, bf_paths, C, threshold,
+                       auto_mode, manual_mode):
+    blank_global = global_fluor_metrics(blank_path, threshold)
+    paired = all(bf_paths[i] for i in range(len(fluor_paths)))
+    stages, qc_errors = [], []
+    if paired:
+        for fp, bp in zip(fluor_paths, bf_paths):
+            m = trap_metrics(fp, bp, threshold)
+            stages.append(m)
+            if not m["registration"]["ok"]:
+                qc_errors.append(m["registration"]["error"])
+            if m["N"] < MIN_VALID_TRAPS:
+                qc_errors.append(f"Only {m['N']} valid traps; minimum is {MIN_VALID_TRAPS}")
+        f0 = stages[0]["f"]
+        if auto_mode:
+            mode = "analog" if f0 > F_GATE else "digital"
+        else:
+            mode = manual_mode
+        if mode == "digital":
+            y = np.array([safe_lambda(m["f"]) for m in stages])
+            S0 = 0.0
+            S_abs = y.copy()
+        else:
+            blank_signal = blank_global["signal"]
+            S_abs = np.array([m["signal"] for m in stages], float)
+            y = S_abs - blank_signal
+            S0 = blank_signal
     else:
-        Ns = [bm["N"] if bm is not None else None for bm in bm_use]
-        fs = [np.nan] * n
-        y = I_net
+        mode, f0 = "analog", np.nan
+        stages = [global_fluor_metrics(p, threshold) for p in fluor_paths]
+        S_abs = np.array([m["signal"] for m in stages], float)
+        S0 = blank_global["signal"]
+        y = S_abs - S0
+    fit = fit_standard_addition(C, y)
+    gate = gradient_gate(S0, list(S_abs), C, fit["T"])
+    return {"threshold": int(threshold), "theta_distance": abs(threshold),
+            "mode": mode, "paired_registration": paired, "f0": float(f0),
+            "blank_signal": float(S0), "stage_signals": S_abs.tolist(),
+            "y": y.tolist(), "fit": fit, "gate": gate,
+            "stages": stages, "qc_errors": qc_errors}
 
-    C_arr = np.array(C_list, dtype=float)
-    a, b, yf, r2 = fit_line(C_arr, y)
-    T = (-b / a) if (np.isfinite(a) and abs(a) > 1e-12) else np.nan
 
-    return {"analyte": analyte, "mode": mode, "f0": f0, "T_est": T_est,
-            "four_point": four_pt, "C": C_arr, "y": y,
-            "ns_net": n_net.astype(int), "Ns": Ns, "fs": fs,
-            "I_net": I_net, "n_blank": n_blank, "I_blank": I_blank,
-            "a": a, "b": b, "r2": r2, "T": T, "k": k, "alpha": alpha,
-            "has_bf": has_bf_any, "has_bf_stage1": has_bf_stage1}
+def select_threshold(blank_path, fluor_paths, bf_paths, C, theta0,
+                     auto_mode, manual_mode, manual_theta=None):
+    """
+    The threshold is auto-adjusted until the endpoint inequality holds:
+    g1 <= g2 with two stages, g1 <= g3 with three, g1 <= g4 with four, and so on.
+    The sweep starts at theta0 = BG + 3 SD and moves outward; it stops at the
+    first threshold that satisfies the rule with valid QC and a negative
+    x-intercept. If no threshold in 0-255 works, the smallest-violation
+    candidate is returned and flagged non-reportable.
+    """
+    evaluations, solved = [], None
+    for theta in threshold_candidates(theta0, manual_theta):
+        try:
+            ev = evaluate_threshold(blank_path, fluor_paths, bf_paths, C, theta,
+                                    auto_mode, manual_mode)
+        except Exception as exc:
+            evaluations.append({"threshold": theta, "error": str(exc),
+                                "theta_distance": abs(theta - theta0),
+                                "qc_errors": [str(exc)]})
+            continue
+        ev["theta_distance"] = abs(theta - theta0)
+        evaluations.append(ev)
+        fit, gate = ev["fit"], ev["gate"]
+        feasible = (not ev["qc_errors"] and np.isfinite(fit["T"]) and fit["T"] > 0
+                    and fit["intercept_sign_ok"] and gate["n_evaluable"] >= 1)
+        if feasible and gate["pass"] is True:
+            solved = ev
+            break
 
-# -----------------------------------------------------------------------------
-# Runtime state + debounce
-# -----------------------------------------------------------------------------
-fluor_paths = [None] * 5   # 0 blank, 1..4 T+C0..C3
-bf_paths    = [None] * 4
-fluor_img_labels, bf_img_labels = [], []
-fluor_info_labels, bf_info_labels = [], []
+    if solved is not None:
+        chosen = solved
+        chosen["gate_solved"] = True
+        chosen["selection_reason"] = (
+            "Threshold auto-adjusted until "
+            f"{chosen['gate']['required_rule']} held; nearest such threshold "
+            "to theta0 = BG + 3 SD")
+    else:
+        scored = [e for e in evaluations if "fit" in e and e["gate"]["n_evaluable"] >= 1]
+        if not scored:
+            scored = [e for e in evaluations if "fit" in e]
+        if not scored:
+            raise RuntimeError("No threshold candidate could be evaluated")
 
+        def rank(e):
+            fit, gate = e["fit"], e["gate"]
+            viol = gate.get("violation", np.inf)
+            viol = viol if np.isfinite(viol) else 1e12
+            return (1 if e.get("qc_errors") else 0,
+                    0 if fit.get("intercept_sign_ok") else 1,
+                    viol, e["theta_distance"], e["threshold"])
+
+        chosen = min(scored, key=rank)
+        chosen["gate_solved"] = False
+        chosen["selection_reason"] = (
+            "No threshold in 0-255 satisfied the endpoint inequality; "
+            "minimum-violation candidate reported for diagnosis only")
+
+    chosen["theta0"] = int(theta0)
+    chosen["n_candidates"] = len(evaluations)
+    chosen["candidate_summary"] = [{
+        "threshold": e["threshold"], "distance": e["theta_distance"],
+        "T": e.get("fit", {}).get("T"),
+        "x_intercept": e.get("fit", {}).get("x_intercept"),
+        "gate_rule": e.get("gate", {}).get("required_rule"),
+        "gate_pass": e.get("gate", {}).get("pass"),
+        "violation": e.get("gate", {}).get("violation"),
+        "qc_errors": e.get("qc_errors", []), "error": e.get("error", "")
+    } for e in evaluations]
+    return chosen
+
+
+fluor_paths = [None] * 5   # blank, T+C0, T+C1, T+C2, T+C3
+bf_paths = [None] * 4      # T+C0 .. T+C3
+fluor_info, fluor_preview = [], []
+bf_info, bf_preview = [], []
+last_result = None
 _debounce_id = None
+
+
 def schedule_recalc(*_):
     global _debounce_id
     if _debounce_id is not None:
         try: root.after_cancel(_debounce_id)
         except Exception: pass
-    _debounce_id = root.after(DEBOUNCE_MS, calculate_and_display)
+    _debounce_id = root.after(DEBOUNCE_MS, calculate)
 
-# -----------------------------------------------------------------------------
-# Reused matplotlib canvas
-# -----------------------------------------------------------------------------
-_fig = Figure(figsize=(6.2, 4.2), dpi=100)
-_ax = _fig.add_subplot(111)
-_canvas_holder = {"canvas": None}
 
-def ensure_canvas():
-    if _canvas_holder["canvas"] is None:
-        c = FigureCanvasTkAgg(_fig, master=plot_frame)
-        c.get_tk_widget().grid(row=0, column=0, sticky=(N, S, E, W))
-        _canvas_holder["canvas"] = c
-    return _canvas_holder["canvas"]
-
-def plot_grasp(res):
-    ensure_canvas()
-    _ax.clear()
-    C = res["C"]; y = res["y"]; mode = res["mode"]
-    a = res["a"]; b = res["b"]; T = res["T"]; r2 = res["r2"]
-    sig = "−ln(1 − f)" if mode == "digital" else "Net intensity (a.u.)"
-    x_lo = min(-max(1.0, abs(T) * 1.3 if np.isfinite(T) else 1.0),
-               float(np.min(C)) - 0.1 * max(1.0, float(np.max(C))))
-    x_hi = float(np.max(C)) * 1.25 + 1e-9
-    xl = np.linspace(x_lo, x_hi, 200)
-    _ax.scatter(C, y, color="#2563EB", s=55, zorder=5, label="GRASP points")
-    if np.isfinite(a):
-        _ax.plot(xl, a * xl + b, color="#2563EB", lw=2.0, label="OLS fit")
-    _ax.axhline(0, color="black", lw=0.7, ls="--")
-    _ax.axvline(0, color="gray",  lw=0.8, ls="--")
-    if np.isfinite(T):
-        _ax.axvline(T, color="#16A34A", lw=1.4, ls=":", label=f"T = {T:.4f}")
-        _ax.scatter([T], [0], color="#16A34A", marker="*", s=120, zorder=6)
-    n_pts = 4 if res["four_point"] else 3
-    tag = "analog-only" if not res["has_bf_stage1"] else mode
-    _ax.set_title(f"GRASP | {res['analyte']} | {tag} | {n_pts}-pt | R²={r2:.4f}",
-                  fontsize=10)
-    _ax.set_xlabel("Added concentration Ci")
-    _ax.set_ylabel(f"Signal yi ({sig})")
-    _ax.grid(alpha=0.25); _ax.legend(fontsize=8)
-    _fig.tight_layout()
-    _canvas_holder["canvas"].draw_idle()
-
-# -----------------------------------------------------------------------------
-# Preview helpers
-# -----------------------------------------------------------------------------
-def show_fluor_preview(idx, metrics):
-    img = Image.fromarray(metrics["preview"]); img.thumbnail((330, 112))
-    tk = ImageTk.PhotoImage(img)
-    fluor_img_labels[idx].config(image=tk); fluor_img_labels[idx].image = tk
-    fluor_info_labels[idx].config(
-        text=f"n={metrics['n']}  |  analog y={metrics['net_intensity']:.2e}")
-
-def show_bf_preview(idx, metrics):
-    img = Image.fromarray(metrics["preview"]); img.thumbnail((280, 112))
-    tk = ImageTk.PhotoImage(img)
-    bf_img_labels[idx].config(image=tk); bf_img_labels[idx].image = tk
-    bf_info_labels[idx].config(text=f"N = {metrics['N']}")
-
-def get_params():
-    return dict(ft=int(fluor_thresh_sl.get()), bgr=int(bg_radius_sl.get()),
-                mna=int(min_area_sl.get()), mxa=int(max_area_sl.get()))
-
-# -----------------------------------------------------------------------------
-# Callbacks
-# -----------------------------------------------------------------------------
-def select_fluor(idx):
-    path = filedialog.askopenfilename(
-        filetypes=[("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"), ("All", "*.*")])
+def select_image(target, idx):
+    path = filedialog.askopenfilename(filetypes=[
+        ("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"), ("All", "*.*")])
     if not path: return
-    fluor_paths[idx] = path
-    try:
-        p = get_params()
-        m = analyze_fluorescence(path, p["ft"], p["bgr"], p["mna"], p["mxa"])
-        show_fluor_preview(idx, m)
-        schedule_recalc()
-    except Exception as e:
-        fluor_info_labels[idx].config(text=f"Error: {e}")
+    if target == "fluor":
+        fluor_paths[idx] = path
+        fluor_info[idx].config(text=Path(path).name[:20])
+        if idx == 0:
+            try:
+                t, mu, sd = initial_threshold(path)
+                threshold_scale.set(t)
+                threshold_note.config(text=f"BG={mu:.1f} SD={sd:.2f} theta0={t}")
+            except Exception as e:
+                threshold_note.config(text=f"Threshold error: {e}")
+    else:
+        bf_paths[idx] = path
+        bf_info[idx].config(text=Path(path).name[:20])
+    refresh_mode_button(); schedule_recalc()
 
-def select_bf(idx):
-    path = filedialog.askopenfilename(
-        filetypes=[("Images", "*.png *.jpg *.jpeg *.tif *.tiff *.bmp"), ("All", "*.*")])
-    if not path: return
-    bf_paths[idx] = path
-    try:
-        p = get_params()
-        m = analyze_brightfield(path, p["mna"], p["mxa"])
-        show_bf_preview(idx, m)
-        schedule_recalc()
-    except Exception as e:
-        bf_info_labels[idx].config(text=f"Error: {e}")
 
 def clear_bf(idx):
     bf_paths[idx] = None
-    bf_info_labels[idx].config(text="No image (analog-only)")
-    bf_img_labels[idx].config(image=''); bf_img_labels[idx].image = None
-    schedule_recalc()
+    bf_info[idx].config(text="none")
+    bf_preview[idx].config(image=""); bf_preview[idx].image = None
+    refresh_mode_button(); schedule_recalc()
 
-def needs_4pt(): return bool(use_4pt_var.get())
-def required_channels(): return 4 if needs_4pt() else 3
 
-def refresh_mode_btn():
-    if auto_mode_var.get():
-        mode_btn.config(text="Mode: AUTO (click → Manual Digital)", style="Auto.TButton")
+def loaded_stage_count():
+    n = 0
+    for i in range(1, 5):
+        if fluor_paths[i] is None: break
+        n += 1
+    return n
+
+
+def read_concentrations(n):
+    vals = [0.0]
+    for var in (c1_var, c2_var, c3_var)[:max(0, n - 1)]:
+        vals.append(float(var.get().strip()))
+    if len(vals) != n: raise ValueError("Enter all Ci values for loaded stages")
+    if any(vals[i] <= vals[i-1] for i in range(1, len(vals))):
+        raise ValueError("Require 0 = C0 < C1 < C2 < C3")
+    return vals
+
+
+def all_loaded_bf(n):
+    return n > 0 and all(bf_paths[i] is not None for i in range(n))
+
+
+def refresh_mode_button():
+    n = loaded_stage_count()
+    if not all_loaded_bf(n):
+        mode_button.config(text="ANALOG-ONLY (no paired BF)", state="disabled")
     else:
-        lbl = "Digital" if manual_mode_var.get() == "digital" else "Analog"
-        mode_btn.config(text=f"Mode: MANUAL [{lbl}] (click → next)", style="Manual.TButton")
+        mode_button.config(state="normal")
+        if auto_mode.get():
+            mode_button.config(text="AUTO (f0<=0.7 digital)")
+        else:
+            mode_button.config(text=f"MANUAL: {manual_mode.get().upper()}")
+
 
 def toggle_mode():
-    if auto_mode_var.get():
-        auto_mode_var.set(False); manual_mode_var.set("digital")
-    elif manual_mode_var.get() == "digital":
-        manual_mode_var.set("analog")
+    if auto_mode.get():
+        auto_mode.set(False); manual_mode.set("digital")
+    elif manual_mode.get() == "digital":
+        manual_mode.set("analog")
     else:
-        auto_mode_var.set(True)
-    refresh_mode_btn(); schedule_recalc()
+        auto_mode.set(True)
+    refresh_mode_button(); schedule_recalc()
 
-def delete_all():
-    _IMG_CACHE.clear(); _FLUOR_CACHE.clear(); _BF_CACHE.clear()
-    for i in range(5):
-        fluor_paths[i] = None
-        if i < len(fluor_info_labels):
-            fluor_info_labels[i].config(text="No image selected")
-            fluor_img_labels[i].config(image=''); fluor_img_labels[i].image = None
-    for i in range(4):
-        bf_paths[i] = None
-        if i < len(bf_info_labels):
-            bf_info_labels[i].config(text="No image (optional)")
-            bf_img_labels[i].config(image=''); bf_img_labels[i].image = None
-    for w in (stage1_lbl, counts_lbl, mode_lbl, slope_lbl, icpt_lbl, result_lbl):
-        w.config(text="")
-    if _canvas_holder["canvas"] is not None:
-        _ax.clear(); _canvas_holder["canvas"].draw_idle()
 
-def calculate_and_display(*_):
-    need_n = required_channels()
-    # Fluorescence is REQUIRED
-    if fluor_paths[0] is None or any(fluor_paths[i] is None for i in range(1, 1 + need_n)):
-        result_lbl.config(text="Fluorescence required: blank + T+C0..T+C2 (+ C3 if 4-pt).")
+def set_preview(label, arr, size=(145, 52)):
+    if arr.ndim == 2: img = Image.fromarray(arr)
+    else: img = Image.fromarray(arr.astype(np.uint8))
+    img.thumbnail(size)
+    tkimg = ImageTk.PhotoImage(img)
+    label.config(image=tkimg); label.image = tkimg
+
+
+def status_from_result(res):
+    fit, gate = res["fit"], res["gate"]
+    if res["qc_errors"] or not np.isfinite(fit["T"]) or not fit["intercept_sign_ok"]:
+        return STATUS_FAIL
+    if gate["pass"] is not True:
+        return STATUS_OUT
+    return STATUS_IN if gate["coverage"] == "full" else STATUS_PARTIAL
+
+
+def calculate(*_):
+    global last_result
+    n = loaded_stage_count()
+    if fluor_paths[0] is None or n < 2:
+        result_label.config(text="Load PBS blank + T+C0 + T+C1 (minimum).")
+        return
+    try:
+        C = read_concentrations(n)
+        theta0, mu, sd = initial_threshold(fluor_paths[0])
+        manual_theta = int(threshold_scale.get()) if manual_threshold.get() else None
+        chosen = select_threshold(fluor_paths[0], fluor_paths[1:1+n], bf_paths[:n], C,
+                                  theta0, auto_mode.get(), manual_mode.get(), manual_theta)
+        chosen.update({"C": C, "blank_path": fluor_paths[0],
+                       "fluor_paths": fluor_paths[1:1+n], "bf_paths": bf_paths[:n],
+                       "blank_mu": mu, "blank_sd": sd,
+                       "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                       "status": ""})
+        chosen["status"] = status_from_result(chosen)
+        last_result = chosen
+    except Exception as e:
+        result_label.config(text=f"Analysis error: {e}", foreground="#B91C1C")
         return
 
-    p = get_params()
-    try:
-        fm_blank = analyze_fluorescence(fluor_paths[0], p["ft"], p["bgr"], p["mna"], p["mxa"])
-        fm_list = [analyze_fluorescence(fluor_paths[i], p["ft"], p["bgr"], p["mna"], p["mxa"])
-                   for i in range(1, 1 + need_n)]
-    except Exception as e:
-        result_lbl.config(text=f"Fluor analysis error: {e}"); return
+    threshold_scale.set(chosen["threshold"])
+    threshold_note.config(
+        text=f"theta0={theta0} -> theta={chosen['threshold']} "
+             f"({chosen['n_candidates']} tried); "
+             f"{'rule satisfied' if chosen.get('gate_solved') else 'NO solution in 0-255'}")
+    fit, gate = chosen["fit"], chosen["gate"]
+    r2 = "n/a (2-point)" if not np.isfinite(fit["r2"]) else f"{fit['r2']:.4f}"
+    warn = "" if fit["intercept_sign_ok"] else " [invalid +x intercept]"
+    result_label.config(text=f"T={fit['T']:.5g} fM{warn}\n"
+                             f"x-int={fit['x_intercept']:.5g}; R2={r2}; "
+                             f"mode={chosen['mode']}")
+    status = chosen["status"]
+    color = "#15803D" if status == STATUS_IN else ("#B91C1C" if status in (STATUS_OUT, STATUS_FAIL) else "#B45309")
+    status_label.config(text=status + (f"\n{gate['message']}" if gate['message'] and gate['message'] != status else ""),
+                        foreground=color)
+    grads = "\n".join(f"{k}={v:.5g}" for k, v in
+                      sorted(gate["gradients"].items(), key=lambda kv: int(kv[0][1:])))
+    checks = "\n".join(f"{'OK' if x['pass'] else 'FAIL'}: {x['left']}<={x['right']} "
+                       f"({x['left_value']:.4g} vs {x['right_value']:.4g})"
+                       for x in gate["checks"])
+    chain_label.config(text=f"rule: {gate.get('rule_expanded', gate['required_rule'])}\n"
+                            + grads + ("\n" + checks if checks else ""))
+    qc_label.config(text=("QC: PASS" if not chosen["qc_errors"] else
+                          "QC: " + "; ".join(chosen["qc_errors"])))
 
-    # Bright-field is OPTIONAL
-    bm_list = []
-    bf_errors = []
-    for i in range(need_n):
-        if bf_paths[i] is None:
-            bm_list.append(None)
+    for i, stage in enumerate(chosen["stages"]):
+        if chosen["paired_registration"]:
+            set_preview(fluor_preview[i+1], stage["preview"])
+            fluor_info[i+1].config(text=f"{stage['n_positive']}/{stage['N']} pos "
+                                         f"f={stage['f']:.3f}")
+            bf = segment_traps(bf_paths[i])
+            set_preview(bf_preview[i], bf["preview"])
+            bf_info[i].config(text=f"N={bf['N']} rej={sum(bf['rejected'].values())}")
         else:
-            try:
-                bm_list.append(analyze_brightfield(bf_paths[i], p["mna"], p["mxa"]))
-            except Exception as e:
-                bf_errors.append(f"BF#{i}: {e}")
-                bm_list.append(None)
+            img = cached_gray(fluor_paths[i+1])
+            set_preview(fluor_preview[i+1], img)
+            fluor_info[i+1].config(text=f"S={stage['signal']:.3e}")
+    set_preview(fluor_preview[0], cached_gray(fluor_paths[0]))
+    fluor_info[0].config(text=f"S0={chosen['blank_signal']:.3e}")
+    plot_result(chosen)
 
-    C1_in = c1_var.get().strip(); C2_in = c2_var.get().strip()
-    uC1 = None if C1_in in ("", "auto") else float(C1_in)
-    uC2 = None if C2_in in ("", "auto") else float(C2_in)
 
-    try:
-        res = run_grasp(fm_blank, fm_list, bm_list,
-                        auto=auto_mode_var.get(), manual=manual_mode_var.get(),
-                        analyte=analyte_var.get(),
-                        user_C1=uC1, user_C2=uC2,
-                        use_4pt_if_allowed=needs_4pt())
-    except Exception as e:
-        result_lbl.config(text=f"GRASP error: {e}"); return
+def plot_result(res):
+    ax.clear()
+    C = np.asarray(res["C"]); y = np.asarray(res["y"])
+    fit = res["fit"]
+    ax.scatter(C, y, color="#2563EB", s=55, label="standard-addition points")
+    if np.isfinite(fit["a"]):
+        lo = min(-1.2 * abs(fit["T"]), -1.0); hi = max(C) * 1.2 + EPS
+        x = np.linspace(lo, hi, 200)
+        ax.plot(x, fit["a"] * x + fit["b"], color="#2563EB")
+    if np.isfinite(fit["x_intercept"]):
+        ax.scatter([fit["x_intercept"]], [0], marker="*", s=120,
+                   color="#16A34A", zorder=6,
+                   label=f"x-int={fit['x_intercept']:.4g} -> T={fit['T']:.4g} fM")
+    ax.axhline(0, color="black", lw=.7, ls="--")
+    ax.axvline(0, color="grey", lw=.7, ls="--")
+    ax.set_xlabel("Added concentration Ci (fM)")
+    ax.set_ylabel("lambda" if res["mode"] == "digital" else "S_ti - S0 (a.u.)")
+    ax.set_title(f"{res['mode']} | threshold={res['threshold']} | {res['status']}",
+                 fontsize=9, color="#B91C1C" if res["status"] == STATUS_OUT else "black")
+    ax.grid(alpha=.25); ax.legend(fontsize=8); fig.tight_layout(); canvas.draw_idle()
 
-    # Status display
-    if not res["has_bf_stage1"]:
-        stage1_txt = (f"Stage 1 — [analog-only, no BF]  "
-                      f"I0_net={res['I_net'][0]:.2e}  "
-                      f"T_est={res['T_est']:.3f} fM  α={res['alpha']:.2e}")
-    else:
-        stage1_txt = (f"Stage 1 — f0={res['f0']:.4f}  mode={res['mode']}  "
-                      f"T_est={res['T_est']:.3f} fM  k={res['k']:.2e}  α={res['alpha']:.2e}")
-    stage1_lbl.config(text=stage1_txt)
 
-    Ns_disp = ", ".join("—" if N is None else str(int(N)) for N in res["Ns"])
-    counts_lbl.config(
-        text=f"n_net=[{', '.join(map(str, res['ns_net']))}]  N=[{Ns_disp}]  "
-             f"(blank n={res['n_blank']}, I={res['I_blank']:.1e})")
-    mode_lbl.config(text=f"{'4-pt' if res['four_point'] else '3-pt'} OLS  "
-                         f"mode={res['mode']}  C={np.round(res['C'], 4).tolist()}")
-    slope_lbl.config(text=f"a = {res['a']:.5g}")
-    icpt_lbl.config(text=f"b = {res['b']:.5g}")
-    if not np.isfinite(res["T"]):
-        result_lbl.config(text="Failed: slope near zero."); return
-    msg = f"T = {res['T']:.4f} fM   R² = {res['r2']:.4f}"
-    if bf_errors:
-        msg += "  |  " + "; ".join(bf_errors)
-    if not res["has_bf"]:
-        msg += "  |  analog-only fallback (no BF supplied)"
-    result_lbl.config(text=msg)
+def export_audit():
+    if last_result is None:
+        messagebox.showwarning("No result", "Run the analysis first."); return
+    folder = filedialog.askdirectory(title="Select audit-export folder")
+    if not folder: return
+    out = Path(folder)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = out / f"GRASP_audit_{stamp}"
+    base.mkdir(parents=True, exist_ok=True)
+    res = dict(last_result)
+    stages = res.pop("stages", [])
+    hashes = {}
+    for p in [res["blank_path"]] + res["fluor_paths"] + [x for x in res["bf_paths"] if x]:
+        hashes[str(p)] = file_sha256(p)
+    audit = {"software": {**AUDIT_CONFIG, "python": platform.python_version(),
+                           "opencv": cv2.__version__, "numpy": np.__version__},
+             "input_sha256": hashes, "result": res}
+    with open(base / "audit.json", "w", encoding="utf-8") as f:
+        json.dump(audit, f, indent=2, ensure_ascii=False, default=lambda x: x.item() if hasattr(x, "item") else str(x))
+    if res["paired_registration"]:
+        for i, stage in enumerate(stages):
+            with open(base / f"stage_{i}_trap_assignments.csv", "w", newline="", encoding="utf-8") as f:
+                fields = ["trap_id", "positive", "overlap", "positive_pixels",
+                          "integrated_intensity", "mean_intensity"]
+                w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(stage["trap_rows"])
+    messagebox.showinfo("Export complete", f"Audit exported to:\n{base}")
 
-    show_fluor_preview(0, fm_blank)
-    for i, m in enumerate(fm_list):
-        show_fluor_preview(i + 1, m)
-    for i, m in enumerate(bm_list):
-        if m is not None:
-            show_bf_preview(i, m)
-    plot_grasp(res)
 
-def auto_optimize_threshold():
-    need_n = required_channels()
-    if fluor_paths[0] is None or any(fluor_paths[i] is None for i in range(1, 1 + need_n)):
-        messagebox.showwarning("Missing", "Select all fluorescence images first."); return
-    p = get_params()
-    best_t, best_r2 = fluor_thresh_sl.get(), -1.0
-    for t in range(5, 251, 10):
-        try:
-            fm_blank = analyze_fluorescence(fluor_paths[0], t, p["bgr"], p["mna"], p["mxa"])
-            fm_list = [analyze_fluorescence(fluor_paths[i], t, p["bgr"], p["mna"], p["mxa"])
-                       for i in range(1, 1 + need_n)]
-            bm_list = []
-            for i in range(need_n):
-                if bf_paths[i] is None:
-                    bm_list.append(None)
-                else:
-                    bm_list.append(analyze_brightfield(bf_paths[i], p["mna"], p["mxa"]))
-            C1_in = c1_var.get().strip(); C2_in = c2_var.get().strip()
-            uC1 = None if C1_in in ("", "auto") else float(C1_in)
-            uC2 = None if C2_in in ("", "auto") else float(C2_in)
-            res = run_grasp(fm_blank, fm_list, bm_list,
-                            auto=auto_mode_var.get(), manual=manual_mode_var.get(),
-                            analyte=analyte_var.get(),
-                            user_C1=uC1, user_C2=uC2,
-                            use_4pt_if_allowed=needs_4pt())
-            if np.isfinite(res["T"]) and res["r2"] > best_r2:
-                best_r2, best_t = res["r2"], t
-        except Exception:
-            continue
-    fluor_thresh_sl.set(best_t)
-    result_lbl.config(text=f"Auto threshold = {best_t}  (R² = {best_r2:.4f})")
-    calculate_and_display()
+def clear_all():
+    global last_result
+    last_result = None; _IMG_CACHE.clear(); _BF_CACHE.clear(); _REG_CACHE.clear()
+    for i in range(5):
+        fluor_paths[i] = None; fluor_info[i].config(text="none")
+        fluor_preview[i].config(image=""); fluor_preview[i].image = None
+    for i in range(4):
+        bf_paths[i] = None; bf_info[i].config(text="none")
+        bf_preview[i].config(image=""); bf_preview[i].image = None
+    for w in (result_label, status_label, chain_label, qc_label): w.config(text="")
+    ax.clear(); canvas.draw_idle(); refresh_mode_button()
 
-# -----------------------------------------------------------------------------
-# GUI
-# -----------------------------------------------------------------------------
+
 root = Tk()
-root.title("GRASP / dB-LFIA  (v2 — analog-only fallback supported)")
+root.title(f"{APP_NAME} v{APP_VERSION}")
+PREVIEW_W, PREVIEW_H = 145, 52
+CTRL_W = 262
+root.minsize(940, 590)
 root.resizable(True, True)
-
+try:
+    root.tk.call("tk", "scaling", min(float(root.tk.call("tk", "scaling")), 1.0))
+except Exception:
+    pass
 style = ttk.Style(root)
-style.configure("Auto.TButton",   foreground="#1D4ED8", font=("", 9, "bold"))
-style.configure("Manual.TButton", foreground="#B45309", font=("", 9, "bold"))
+for x in ("TLabel", "TButton", "TCheckbutton", "TEntry"):
+    style.configure(x, font=("Arial", 8))
+style.configure("Tiny.TButton", font=("Arial", 7), padding=(1, 0))
+style.configure("TLabelframe.Label", font=("Arial", 8, "bold"))
+main = ttk.Frame(root, padding=3)
+main.grid(row=0, column=0, sticky=(N, S, E, W))
+root.rowconfigure(0, weight=1); root.columnconfigure(0, weight=1)
+main.rowconfigure(0, weight=1); main.columnconfigure(2, weight=1)
 
-auto_mode_var   = BooleanVar(value=True)
-manual_mode_var = StringVar(value="digital")
-analyte_var     = StringVar(value="IgE")
-use_4pt_var     = BooleanVar(value=False)
+_ph = []
+def blank_preview(parent):
+    p = ImageTk.PhotoImage(Image.new("RGB", (PREVIEW_W, PREVIEW_H), (238, 238, 238)))
+    _ph.append(p)
+    w = Label(parent, image=p, bd=1, relief="sunken"); w.image = p
+    return w
 
-mf = ttk.Frame(root, padding="10 10 12 12")
-mf.grid(row=0, column=0, sticky=(N, W, E, S))
-root.columnconfigure(0, weight=1); root.rowconfigure(0, weight=1)
+images = ttk.LabelFrame(main, text="Image inputs", padding=2)
+images.grid(row=0, column=0, sticky=(N, W))
+ttk.Label(images, text="Stage", width=10, font=("Arial", 8, "bold")).grid(row=0, column=0, sticky=W)
+ttk.Label(images, text="Fluorescence", font=("Arial", 8, "bold")).grid(row=0, column=1, sticky=W)
+ttk.Label(images, text="Bright-field", font=("Arial", 8, "bold")).grid(row=0, column=2, sticky=W, padx=(3, 0))
+for i, title in enumerate(("S0 blank", "St0 T+C0", "St1 T+C1", "St2 T+C2", "St3 T+C3")):
+    r = i + 1
+    ttk.Label(images, text=title, width=10, font=("Arial", 8, "bold")).grid(row=r, column=0, sticky=(N, W))
+    fc = ttk.Frame(images); fc.grid(row=r, column=1, sticky=W, pady=1)
+    ttk.Button(fc, text="Fluor", width=6, style="Tiny.TButton",
+               command=lambda i=i: select_image("fluor", i)).grid(row=0, column=0)
+    fi = ttk.Label(fc, text="none", width=20, anchor=W, font=("Arial", 7))
+    fi.grid(row=0, column=1); fluor_info.append(fi)
+    fp = blank_preview(fc); fp.grid(row=1, column=0, columnspan=2); fluor_preview.append(fp)
+    if i > 0:
+        bc = ttk.Frame(images); bc.grid(row=r, column=2, sticky=W, padx=(3, 0), pady=1)
+        ttk.Button(bc, text="BF", width=4, style="Tiny.TButton",
+                   command=lambda j=i-1: select_image("bf", j)).grid(row=0, column=0)
+        ttk.Button(bc, text="x", width=2, style="Tiny.TButton",
+                   command=lambda j=i-1: clear_bf(j)).grid(row=0, column=1)
+        bi = ttk.Label(bc, text="none", width=17, anchor=W, font=("Arial", 7))
+        bi.grid(row=0, column=2); bf_info.append(bi)
+        bp = blank_preview(bc); bp.grid(row=1, column=0, columnspan=3); bf_preview.append(bp)
 
-# Left: image panel
-img_panel = ttk.Frame(mf)
-img_panel.grid(row=0, column=0, sticky=(N, W, E, S), padx=(0, 12))
+controls = ttk.Frame(main, width=CTRL_W, padding=(4, 0, 2, 0))
+controls.grid(row=0, column=1, sticky=(N, S, W)); controls.grid_propagate(False)
 
-blank_fr = ttk.LabelFrame(img_panel, text=" ① Screening blank (PBS, fluorescence only) ",
-                          padding="4 4 4 4")
-blank_fr.grid(row=0, column=0, sticky=(W, E), pady=(0, 6))
-ttk.Button(blank_fr, text="Fluorescence…", width=16,
-           command=lambda: select_fluor(0)).grid(row=0, column=0, padx=4)
-lbl0 = ttk.Label(blank_fr, text="No image selected", font=("", 8))
-lbl0.grid(row=0, column=1, sticky=W); fluor_info_labels.append(lbl0)
-il0 = Label(blank_fr, bd=1, relief="sunken")
-il0.grid(row=1, column=0, columnspan=2, sticky=W, pady=(2, 0))
-fluor_img_labels.append(il0)
+cf = ttk.LabelFrame(controls, text="Spikes (fM)", padding=3)
+cf.grid(row=0, column=0, sticky=(E, W))
+c1_var, c2_var, c3_var = StringVar(), StringVar(), StringVar()
+for k, (nm, var) in enumerate((("C1", c1_var), ("C2", c2_var), ("C3", c3_var))):
+    ttk.Label(cf, text=nm).grid(row=0, column=2 * k)
+    e = ttk.Entry(cf, textvariable=var, width=6); e.grid(row=0, column=2 * k + 1)
+    e.bind("<KeyRelease>", schedule_recalc)
 
-PAIR_TITLES = [
-    "② T + C0 (screening test)",
-    "③ T + C1 (spike = T_est)",
-    "④ T + C2 (spike = 2·T_est)",
-    "⑤ T + C3 (optional 4-pt = 4·T_est)",
-]
-for k_idx, title in enumerate(PAIR_TITLES):
-    pf = ttk.LabelFrame(img_panel, text=f" {title} ", padding="4 4 4 4")
-    pf.grid(row=k_idx + 1, column=0, sticky=(W, E), pady=(0, 6))
+pf = ttk.LabelFrame(controls, text="Threshold: auto-adjusted to satisfy rule", padding=3)
+pf.grid(row=1, column=0, sticky=(E, W), pady=2)
+threshold_scale = Scale(pf, from_=0, to=255, orient=HORIZONTAL, length=242,
+                        width=10, font=("Arial", 7), command=schedule_recalc)
+threshold_scale.set(20); threshold_scale.grid(row=0, column=0)
+manual_threshold = BooleanVar(value=False)
+ttk.Checkbutton(pf, text="Lock manual (off = auto-adjust)", variable=manual_threshold,
+                command=schedule_recalc).grid(row=1, column=0, sticky=W)
+threshold_note = ttk.Label(pf, text="theta0 = BG + 3 SD", wraplength=240, font=("Arial", 7))
+threshold_note.grid(row=2, column=0, sticky=W)
+ttk.Label(pf, text="2 stages: g1<=g2 | 3 stages: g1<=g3 | 4 stages: g1<=g4",
+          wraplength=240, font=("Arial", 7), foreground="#555555").grid(row=3, column=0, sticky=W)
 
-    # Fluorescence
-    fs = ttk.LabelFrame(pf, text=" Fluorescence  [required] ", padding="3 3 3 3")
-    fs.grid(row=0, column=0, sticky=(N, W, E, S), padx=(0, 6))
-    fi = k_idx + 1
-    ttk.Button(fs, text="Select…", width=10, command=lambda fi=fi: select_fluor(fi)).grid(row=0, column=0, sticky=W)
-    lblF = ttk.Label(fs, text="No image selected", font=("", 8))
-    lblF.grid(row=0, column=1, sticky=W, padx=4); fluor_info_labels.append(lblF)
-    ilF = Label(fs, bd=1, relief="sunken")
-    ilF.grid(row=1, column=0, columnspan=2, sticky=W, pady=(2, 0))
-    fluor_img_labels.append(ilF)
+mf = ttk.LabelFrame(controls, text="Mode", padding=3)
+mf.grid(row=2, column=0, sticky=(E, W))
+auto_mode = BooleanVar(value=True); manual_mode = StringVar(value="digital")
+mode_button = ttk.Button(mf, text="", command=toggle_mode, width=30)
+mode_button.grid(row=0, column=0)
 
-    # Bright-field (OPTIONAL)
-    bs = ttk.LabelFrame(pf, text=" Bright-field  [OPTIONAL — analog-only if skipped] ",
-                        padding="3 3 3 3")
-    bs.grid(row=0, column=1, sticky=(N, W, E, S))
-    bi = k_idx
-    ttk.Button(bs, text="Select…", width=9,
-               command=lambda bi=bi: select_bf(bi)).grid(row=0, column=0, sticky=W)
-    ttk.Button(bs, text="Clear", width=6,
-               command=lambda bi=bi: clear_bf(bi)).grid(row=0, column=1, sticky=W, padx=(2, 0))
-    lblB = ttk.Label(bs, text="No image (optional)", font=("", 8))
-    lblB.grid(row=0, column=2, sticky=W, padx=4); bf_info_labels.append(lblB)
-    ilB = Label(bs, bd=1, relief="sunken")
-    ilB.grid(row=1, column=0, columnspan=3, sticky=W, pady=(2, 0))
-    bf_img_labels.append(ilB)
+rf = ttk.LabelFrame(controls, text="Result: T = |x-intercept|", padding=3)
+rf.grid(row=3, column=0, sticky=(E, W), pady=2)
+result_label = ttk.Label(rf, text="", justify=LEFT, wraplength=240)
+result_label.grid(row=0, column=0, sticky=W)
+status_label = ttk.Label(rf, text="", justify=LEFT, wraplength=240, font=("Arial", 8, "bold"))
+status_label.grid(row=1, column=0, sticky=W)
 
-# Middle: controls
-ctrl = ttk.Frame(mf); ctrl.grid(row=0, column=1, sticky=(N, W, E, S))
+gf = ttk.LabelFrame(controls, text="Endpoint inequality", padding=3)
+gf.grid(row=4, column=0, sticky=(E, W))
+chain_label = ttk.Label(gf, text="", justify=LEFT, wraplength=240, font=("Consolas", 7))
+chain_label.grid(row=0, column=0, sticky=W)
 
-ana_fr = ttk.LabelFrame(ctrl, text=" Analyte ", padding="6 4")
-ana_fr.grid(row=0, column=0, sticky=(W, E), pady=(0, 6))
-ttk.Label(ana_fr, text="Analyte:").grid(row=0, column=0, sticky=E)
-ttk.Combobox(ana_fr, textvariable=analyte_var, state="readonly",
-             values=list(RESPONSE_CONSTANTS.keys()), width=10).grid(row=0, column=1, padx=4, sticky=W)
+qf = ttk.LabelFrame(controls, text="QC", padding=3)
+qf.grid(row=5, column=0, sticky=(E, W), pady=2)
+qc_label = ttk.Label(qf, text="", wraplength=240, font=("Arial", 7))
+qc_label.grid(row=0, column=0, sticky=W)
 
-spike_fr = ttk.LabelFrame(ctrl, text=" Adaptive spikes (leave blank/auto → from T_est) ",
-                          padding="6 4")
-spike_fr.grid(row=1, column=0, sticky=(W, E), pady=(0, 6))
-ttk.Label(spike_fr, text="C1 (fM):").grid(row=0, column=0, sticky=E)
-c1_var = StringVar(value="auto")
-ttk.Entry(spike_fr, textvariable=c1_var, width=10).grid(row=0, column=1, padx=4, sticky=W)
-ttk.Label(spike_fr, text="C2 (fM):").grid(row=1, column=0, sticky=E)
-c2_var = StringVar(value="auto")
-ttk.Entry(spike_fr, textvariable=c2_var, width=10).grid(row=1, column=1, padx=4, sticky=W)
-ttk.Checkbutton(spike_fr, text="Enable 4-pt when T_est > 100 fM",
-                variable=use_4pt_var,
-                command=schedule_recalc).grid(row=2, column=0, columnspan=2, sticky=W, pady=(3, 0))
+bt = ttk.Frame(controls); bt.grid(row=6, column=0, sticky=W)
+ttk.Button(bt, text="Run", width=7, command=calculate).grid(row=0, column=0)
+ttk.Button(bt, text="Audit", width=7, command=export_audit).grid(row=0, column=1)
+ttk.Button(bt, text="Clear", width=7, command=clear_all).grid(row=0, column=2)
 
-proc_fr = ttk.LabelFrame(ctrl, text=" Processing parameters ", padding="6 4")
-proc_fr.grid(row=2, column=0, sticky=(W, E), pady=(0, 6))
+plot_frame = ttk.LabelFrame(main, text="Standard-addition fit", padding=2)
+plot_frame.grid(row=0, column=2, sticky=(N, S, E, W), padx=(3, 0))
+plot_frame.rowconfigure(0, weight=1); plot_frame.columnconfigure(0, weight=1)
+fig = Figure(figsize=(4.7, 4.0), dpi=100); ax = fig.add_subplot(111)
+canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+canvas.get_tk_widget().grid(row=0, column=0, sticky=(N, S, E, W))
 
-def mks(parent, text, row, lo, hi, init):
-    ttk.Label(parent, text=text).grid(row=row, column=0, sticky=E)
-    s = Scale(parent, from_=lo, to=hi, orient=HORIZONTAL,
-              command=schedule_recalc, length=210)
-    s.set(init); s.grid(row=row, column=1, padx=4, sticky=W)
-    return s
-
-fluor_thresh_sl = mks(proc_fr, "Fluor threshold:", 0, 0,   255, 20)
-bg_radius_sl    = mks(proc_fr, "BG radius:",      1, 1,    80, 25)
-min_area_sl     = mks(proc_fr, "Min area:",       2, 1,   200,  3)
-max_area_sl     = mks(proc_fr, "Max area:",       3, 10, 10000, 5000)
-
-mode_fr = ttk.LabelFrame(ctrl, text=" Signal mode ", padding="6 4")
-mode_fr.grid(row=3, column=0, sticky=(W, E), pady=(0, 6))
-mode_btn = ttk.Button(mode_fr, text="", command=toggle_mode, width=44)
-mode_btn.grid(row=0, column=0, sticky=W, pady=(2, 3))
-ttk.Label(mode_fr,
-          text=f"AUTO: f0 > {F_GATE} → analog, else digital (requires BF)",
-          font=("", 8)).grid(row=1, column=0, sticky=W)
-ttk.Label(mode_fr,
-          text="If no BF images are supplied, GRASP automatically runs analog-only.",
-          font=("", 8, "italic")).grid(row=2, column=0, sticky=W)
-refresh_mode_btn()
-
-res_fr = ttk.LabelFrame(ctrl, text=" Results ", padding="6 4")
-res_fr.grid(row=4, column=0, sticky=(W, E), pady=(0, 6))
-stage1_lbl = ttk.Label(res_fr, text=""); stage1_lbl.grid(row=0, column=0, sticky=W)
-counts_lbl = ttk.Label(res_fr, text=""); counts_lbl.grid(row=1, column=0, sticky=W)
-mode_lbl   = ttk.Label(res_fr, text=""); mode_lbl.grid(row=2, column=0, sticky=W)
-slope_lbl  = ttk.Label(res_fr, text=""); slope_lbl.grid(row=3, column=0, sticky=W)
-icpt_lbl   = ttk.Label(res_fr, text=""); icpt_lbl.grid(row=4, column=0, sticky=W)
-result_lbl = ttk.Label(res_fr, text="", justify=LEFT)
-result_lbl.grid(row=5, column=0, sticky=W, pady=(5, 2))
-
-btn_fr = ttk.Frame(ctrl); btn_fr.grid(row=5, column=0, sticky=W, pady=(4, 8))
-ttk.Button(btn_fr, text="Run GRASP",          command=calculate_and_display).grid(row=0, column=0, padx=3)
-ttk.Button(btn_fr, text="Auto-opt threshold", command=auto_optimize_threshold).grid(row=0, column=1, padx=3)
-ttk.Button(btn_fr, text="Clear all",          command=delete_all).grid(row=0, column=2, padx=3)
-
-plot_col = ttk.Frame(mf); plot_col.grid(row=0, column=2, sticky=(N, W, E, S), padx=(12, 0))
-plot_frame = ttk.LabelFrame(plot_col, text=" GRASP regression plot ", padding="4 4 4 4")
-plot_frame.grid(row=0, column=0, sticky=(N, S, E, W))
-
+refresh_mode_button()
+root.update_idletasks()
+w = min(1420, max(940, images.winfo_reqwidth() + CTRL_W + 410))
+h = min(890, max(590, images.winfo_reqheight() + 35))
+root.geometry(f"{w}x{h}+20+20")
 root.mainloop()
